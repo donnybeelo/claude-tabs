@@ -21,12 +21,19 @@ A tab manager for the [Claude Code CLI](https://claude.com/claude-code). Each ta
 
 ## Install
 
+On Linux and macOS, run:
+
 ```sh
-cargo build --release
-cp target/release/claude-tabs ~/.local/bin/
+curl -fsSL https://raw.githubusercontent.com/donnybeelo/claude-tabs/main/install.sh | sh
 ```
 
-Then run `claude-tabs` in your terminal, or point a launcher at it.
+On Windows, run this in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/donnybeelo/claude-tabs/main/install.ps1 | iex
+```
+
+Both install `claude-tabs` for your user, and update it when ran again.
 
 ## How it works
 
