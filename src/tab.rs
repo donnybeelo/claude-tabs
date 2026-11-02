@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
+use crate::fx::Fx;
 use crate::store::{find_conversation, home};
 use crate::AppEvent;
 
@@ -61,6 +62,8 @@ pub struct Tab {
     pub cwd: PathBuf,
     pub title: String,
     pub running: Option<Running>,
+    pub busy: bool,
+    pub fx: Fx,
 }
 
 pub fn new_session_id() -> String {
@@ -92,7 +95,7 @@ impl Tab {
             shell: Some(Shell::new("claude".into(), vec![flag.into(), self.session.clone()])),
             working_directory: Some(self.cwd.clone()),
             drain_on_exit: false,
-            env: HashMap::new(),
+            env: HashMap::from([("CLAUDE_TABS_PID".into(), std::process::id().to_string())]),
         };
         let pty = tty::new(&options, size.window(), self.id)?;
         let pid = pty.child().id();
@@ -139,6 +142,7 @@ impl Tab {
         else {
             return false;
         };
+        self.busy = info["status"] == "busy";
         let Some(session) = info["sessionId"].as_str() else {
             return false;
         };

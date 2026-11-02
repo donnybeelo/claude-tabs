@@ -4,7 +4,10 @@ use alacritty_terminal::term::Term;
 use alacritty_terminal::vte::ansi::{Color, CursorShape};
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+use crate::fx::{Fx, MARQUEE_DELAY, MARQUEE_STEP};
 
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum Col {
@@ -30,6 +33,7 @@ const ACTIVE: Col = Col::Rgb(0xd9, 0x77, 0x57);
 const INACTIVE: Col = Col::Rgb(0x8a, 0x8a, 0x8a);
 const HOVERED: Col = Col::Rgb(0xee, 0xee, 0xee);
 const BLACK: Col = Col::Rgb(0, 0, 0);
+const WHITE: Col = Col::Rgb(0xff, 0xff, 0xff);
 
 #[derive(Clone, PartialEq, Default)]
 pub struct Cell {
@@ -59,6 +63,15 @@ pub struct Screen {
     front: Vec<Cell>,
     back: Vec<Cell>,
     out: Vec<u8>,
+    last_frame: Option<Instant>,
+    hover_tab: Option<(usize, Instant)>,
+    closing: Vec<(usize, String, Fx)>,
+}
+
+#[derive(Clone, Copy)]
+enum Slot {
+    Live(usize),
+    Closing(usize),
 }
 
 fn blank() -> Cell {
@@ -115,6 +128,34 @@ fn sgr(cell: &Cell) -> String {
     s
 }
 
+fn mix(a: Col, b: Col, t: f32) -> Col {
+    match (a, b) {
+        (Col::Rgb(r1, g1, b1), Col::Rgb(r2, g2, b2)) => {
+            let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t.clamp(0.0, 1.0)).round() as u8;
+            Col::Rgb(lerp(r1, r2), lerp(g1, g2), lerp(b1, b2))
+        },
+        _ => a,
+    }
+}
+
+/// Scrolls a long title through a window of the given width
+fn marquee(title: &str, width: usize, steps: usize) -> String {
+    let looped: Vec<char> = format!("{title} · ").chars().collect();
+    let mut out = String::new();
+    let mut used = 0;
+    for k in 0..looped.len() {
+        let c = looped[(steps + k) % looped.len()];
+        let w = c.width().unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.extend(std::iter::repeat_n(' ', width - used));
+    out
+}
+
 fn truncate(text: &str, max: usize) -> String {
     if text.width() <= max {
         return text.to_string();
@@ -136,17 +177,30 @@ fn truncate(text: &str, max: usize) -> String {
 impl Screen {
     pub fn new(cols: u16, rows: u16) -> Screen {
         let cells = cols as usize * rows as usize;
-        Screen { cols, rows, front: vec![Cell::default(); cells], back: vec![blank(); cells], out: Vec::new() }
+        Screen {
+            cols,
+            rows,
+            front: vec![Cell::default(); cells],
+            back: vec![blank(); cells],
+            out: Vec::new(),
+            last_frame: None,
+            hover_tab: None,
+            closing: Vec::new(),
+        }
     }
 
     pub fn invalidate(&mut self) {
         self.front.fill(Cell::default());
     }
 
-    fn put_str(&mut self, mut x: u16, y: u16, text: &str, fg: Col, bg: Col, attrs: u16) -> u16 {
+    fn put_str(&mut self, x: u16, y: u16, text: &str, fg: Col, bg: Col, attrs: u16) -> u16 {
+        self.put_str_until(x, self.cols, y, text, fg, bg, attrs)
+    }
+
+    fn put_str_until(&mut self, mut x: u16, limit: u16, y: u16, text: &str, fg: Col, bg: Col, attrs: u16) -> u16 {
         for ch in text.chars() {
             let w = ch.width().unwrap_or(0) as u16;
-            if w == 0 || x + w > self.cols {
+            if w == 0 || x + w > limit.min(self.cols) {
                 continue;
             }
             let i = y as usize * self.cols as usize + x as usize;
@@ -159,43 +213,153 @@ impl Screen {
         x
     }
 
-    pub fn draw_tabbar(&mut self, titles: &[&str], active: usize, hover: Option<u16>) -> Vec<Region> {
+    /// Keeps a closed tab on screen while it shrinks away
+    pub fn close_tab(&mut self, index: usize, title: String, mut fx: Fx) {
+        if fx.placed {
+            fx.opening = false;
+            self.closing.push((index, title, fx));
+        }
+    }
+
+    /// Draws the tab bar with its animations, returning click regions and whether anything is still moving
+    pub fn draw_tabbar(
+        &mut self,
+        tabs: &mut [(&str, &mut Fx)],
+        active: usize,
+        hover: Option<u16>,
+        now: Instant,
+    ) -> (Vec<Region>, bool) {
+        let dt = self.last_frame.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32().min(0.05));
+        self.last_frame = Some(now);
         self.back[..self.cols as usize].fill(blank());
-        let count = titles.len().max(1);
-        let available = self.cols.saturating_sub(3) as usize;
-        let title_max = (available / count).saturating_sub(4).clamp(1, 32);
-        let mut regions = Vec::new();
-        let mut x = 0u16;
-        for (i, title) in titles.iter().enumerate() {
+        let mut closing = std::mem::take(&mut self.closing);
+        let mut order: Vec<Slot> = (0..tabs.len()).map(Slot::Live).collect();
+        for (c, (index, _, _)) in closing.iter().enumerate() {
+            let at = order.iter().position(|slot| matches!(slot, Slot::Live(i) if i >= index)).unwrap_or(order.len());
+            order.insert(at, Slot::Closing(c));
+        }
+        let count = tabs.len().max(1);
+        let available = self.cols.saturating_sub(3);
+        let title_max = (available as usize / count).saturating_sub(4).clamp(1, 32);
+        let title_of = |slot: Slot| match slot {
+            Slot::Live(i) => tabs[i].0.to_string(),
+            Slot::Closing(c) => closing[c].1.clone(),
+        };
+        let titles: Vec<String> = order.iter().map(|&slot| title_of(slot)).collect();
+
+        let mut animating = !closing.is_empty();
+        let mut layout = Vec::new();
+        let mut target_x = 0.0f32;
+        for (&slot, title) in order.iter().zip(&titles) {
             let text = truncate(title, title_max);
             let width = text.width() as u16 + 4;
-            if x + width > available as u16 {
-                break;
-            }
-            let end = x + width;
-            let hovered = hover.is_some_and(|h| h >= x && h < end);
-            let close_hovered = hover.is_some_and(|h| h + 3 >= end && h < end);
-            let bg = if i == active {
-                ACTIVE
-            } else if hovered {
-                HOVERED
-            } else {
-                INACTIVE
+            let fx: &mut Fx = match slot {
+                Slot::Live(i) => tabs[i].1,
+                Slot::Closing(c) => &mut closing[c].2,
             };
-            let after_title = self.put_str(x, 0, &format!(" {text}"), BLACK, bg, BOLD);
+            let (target_width, selected) = match slot {
+                Slot::Live(i) => (width as f32, if i == active { 1.0 } else { 0.0 }),
+                Slot::Closing(_) => (0.0, fx.selected.value),
+            };
+            if !fx.placed {
+                fx.placed = true;
+                fx.x.value = target_x;
+                fx.width.value = if fx.opening { 0.0 } else { target_width };
+                fx.selected.value = selected;
+            }
+            animating |= fx.x.step(target_x, dt);
+            animating |= fx.width.step(target_width, dt);
+            animating |= fx.selected.step(selected, dt);
+            animating |= fx.animating(now);
+            let fits = target_x + width as f32 <= available as f32;
+            target_x += match slot {
+                Slot::Live(_) => target_width,
+                Slot::Closing(_) => fx.width.value,
+            };
+            layout.push((text, width, fits));
+        }
+
+        let fx_of = |slot: Slot| -> &Fx {
+            match slot {
+                Slot::Live(i) => tabs[i].1,
+                Slot::Closing(c) => &closing[c].2,
+            }
+        };
+        let span = |fx: &Fx, width: u16| {
+            let x = fx.x.value.round().max(0.0) as u16;
+            (x, (fx.width.value.round().max(0.0) as u16).min(width))
+        };
+        let hovered_tab = hover.and_then(|h| {
+            order.iter().zip(&layout).find_map(|(&slot, (_, width, _))| {
+                let (x, w) = span(fx_of(slot), *width);
+                match slot {
+                    Slot::Live(i) if h >= x && h < x + w => Some(i),
+                    _ => None,
+                }
+            })
+        });
+        if hovered_tab != self.hover_tab.map(|(i, _)| i) {
+            self.hover_tab = hovered_tab.map(|i| (i, now));
+        }
+
+        let mut regions = Vec::new();
+        let mut bar_end = 0u16;
+        for ((&slot, title), (text, width, fits)) in order.iter().zip(&titles).zip(&layout) {
+            if !fits {
+                continue;
+            }
+            let fx = fx_of(slot);
+            let (x, w) = span(fx, *width);
+            if w == 0 {
+                continue;
+            }
+            let live = match slot {
+                Slot::Live(i) => Some(i),
+                Slot::Closing(_) => None,
+            };
+            let end = x + w;
+            let full = live.is_some() && w == *width;
+            let hovered = live.is_some() && hovered_tab == live;
+            let close_hovered = full && hover.is_some_and(|h| h + 3 >= end && h < end);
+            let base = if hovered && live != Some(active) { HOVERED } else { INACTIVE };
+            let bg = mix(base, ACTIVE, fx.selected.value);
+            let mut shown = text.clone();
+            if let Some((_, since)) = self.hover_tab.filter(|_| hovered && text != title) {
+                let elapsed = now.saturating_duration_since(since);
+                if elapsed >= MARQUEE_DELAY {
+                    let steps = ((elapsed - MARQUEE_DELAY).as_millis() / MARQUEE_STEP.as_millis()) as usize;
+                    shown = marquee(title, text.width(), steps);
+                }
+                animating = true;
+            }
+            let after_title = self.put_str_until(x, end, 0, &format!(" {shown}"), BLACK, bg, BOLD);
             let glyph = if close_hovered { " \u{f00d}" } else { " ×" };
-            self.put_str(after_title, 0, glyph, BLACK, bg, BOLD);
-            self.put_str(end - 1, 0, "▕", BLACK, bg, 0);
-            regions.push(Region { start: x, end: end - 3, target: Target::Tab(i) });
-            regions.push(Region { start: end - 3, end, target: Target::Close(i) });
-            x = end;
+            self.put_str_until(after_title, end, 0, glyph, BLACK, bg, BOLD);
+            if full {
+                self.put_str(end - 1, 0, "▕", BLACK, bg, 0);
+            }
+            for (j, effect) in fx.cells(*width as usize, now).iter().take(w as usize).enumerate() {
+                let cell = &mut self.back[x as usize + j];
+                cell.bg = mix(mix(cell.bg, ACTIVE, effect.accent), WHITE, effect.sweep);
+            }
+            match live {
+                Some(i) if full => {
+                    regions.push(Region { start: x, end: end - 3, target: Target::Tab(i) });
+                    regions.push(Region { start: end - 3, end, target: Target::Close(i) });
+                },
+                Some(i) => regions.push(Region { start: x, end, target: Target::Tab(i) }),
+                None => {},
+            }
+            bar_end = bar_end.max(end);
         }
-        if x + 3 <= self.cols {
-            let hovered = hover.is_some_and(|h| h >= x && h < x + 3);
-            self.put_str(x, 0, " + ", BLACK, if hovered { HOVERED } else { INACTIVE }, BOLD);
-            regions.push(Region { start: x, end: x + 3, target: Target::New });
+        if bar_end + 3 <= self.cols {
+            let hovered = hover.is_some_and(|h| h >= bar_end && h < bar_end + 3);
+            self.put_str(bar_end, 0, " + ", BLACK, if hovered { HOVERED } else { INACTIVE }, BOLD);
+            regions.push(Region { start: bar_end, end: bar_end + 3, target: Target::New });
         }
-        regions
+        closing.retain(|(_, _, fx)| fx.width.value >= 0.5);
+        self.closing = closing;
+        (regions, animating)
     }
 
     /// Copies the visible part of a tab's terminal below the tab bar, returning where the cursor is

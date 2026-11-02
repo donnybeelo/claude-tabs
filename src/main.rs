@@ -1,3 +1,4 @@
+mod fx;
 mod keys;
 mod render;
 mod store;
@@ -6,11 +7,14 @@ mod tab;
 use alacritty_terminal::event::{Event as TermEvent, WindowSize};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
+};
 use std::io::Write;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use fx::Fx;
 use render::{Region, Screen, Target};
 use store::{SavedTab, SavedWindow, Store};
 use tab::{new_session_id, Size, Tab};
@@ -18,10 +22,11 @@ use tab::{new_session_id, Size, Tab};
 pub enum AppEvent {
     Input(Event),
     InputClosed,
+    NewTab,
     Term(u64, TermEvent),
 }
 
-const SETUP: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?1004h\x1b[>1u";
+const SETUP: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?1004h\x1b[>15u";
 const TEARDOWN: &[u8] = b"\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[0m\x1b[?25h\x1b[?1049l";
 
 fn restore_terminal() {
@@ -40,6 +45,13 @@ extern "C" fn on_hangup(_: libc::c_int) {
     }
 }
 
+extern "C" fn on_new_tab(_: libc::c_int) {
+    let fd = HANGUP_PIPE.load(std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        libc::write(fd, b"n".as_ptr().cast(), 1);
+    }
+}
+
 fn watch_hangup(tx: Sender<AppEvent>) {
     let mut fds = [0; 2];
     unsafe {
@@ -48,11 +60,18 @@ fn watch_hangup(tx: Sender<AppEvent>) {
     HANGUP_PIPE.store(fds[1], std::sync::atomic::Ordering::Relaxed);
     unsafe {
         libc::signal(libc::SIGHUP, on_hangup as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_hangup as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGUSR1, on_new_tab as *const () as libc::sighandler_t);
     }
     std::thread::spawn(move || {
         let mut byte = 0u8;
-        if unsafe { libc::read(fds[0], (&mut byte as *mut u8).cast(), 1) } == 1 {
-            let _ = tx.send(AppEvent::InputClosed);
+        while unsafe { libc::read(fds[0], (&mut byte as *mut u8).cast(), 1) } == 1 {
+            if byte == b'n' {
+                let _ = tx.send(AppEvent::NewTab);
+            } else {
+                let _ = tx.send(AppEvent::InputClosed);
+                break;
+            }
         }
     });
 }
@@ -83,6 +102,10 @@ struct App {
     quit: bool,
     closed: Vec<(usize, SavedTab)>,
     cleanups: Vec<std::thread::JoinHandle<()>>,
+    mru: Vec<u64>,
+    cycling: Option<usize>,
+    dragging: bool,
+    animating: bool,
 }
 
 impl App {
@@ -92,7 +115,7 @@ impl App {
 
     fn add_tab(&mut self, session: String, cwd: std::path::PathBuf, title: String) -> usize {
         self.next_id += 1;
-        self.tabs.push(Tab { id: self.next_id, session, cwd, title, running: None });
+        self.tabs.push(Tab { id: self.next_id, session, cwd, title, running: None, busy: false, fx: Fx::default() });
         self.tabs.len() - 1
     }
 
@@ -101,7 +124,11 @@ impl App {
             return;
         }
         self.active = index;
+        if self.cycling.is_none() {
+            self.touch_mru();
+        }
         let tab = &mut self.tabs[index];
+        tab.fx.seen(Instant::now());
         if tab.running.is_none() {
             let _ = tab.start(self.size, &self.tx);
         }
@@ -110,13 +137,47 @@ impl App {
         self.save();
     }
 
+    fn touch_mru(&mut self) {
+        let id = self.tabs[self.active].id;
+        self.mru.retain(|&other| other != id);
+        self.mru.insert(0, id);
+    }
+
+    /// Steps through tabs in most recently used order while Ctrl is held
+    fn cycle(&mut self, step: isize) {
+        let ids: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+        self.mru.retain(|id| ids.contains(id));
+        for id in ids {
+            if !self.mru.contains(&id) {
+                self.mru.push(id);
+            }
+        }
+        if self.mru.len() < 2 {
+            return;
+        }
+        let position = (self.cycling.unwrap_or(0) as isize + step).rem_euclid(self.mru.len() as isize) as usize;
+        self.cycling = Some(position);
+        let id = self.mru[position];
+        if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
+            self.activate(index);
+        }
+    }
+
+    fn end_cycle(&mut self) {
+        if self.cycling.take().is_some() && self.active < self.tabs.len() {
+            self.touch_mru();
+        }
+    }
+
     fn new_tab(&mut self) {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| store::home());
+        let cwd = self.tabs.get(self.active).map(|t| t.cwd.clone()).unwrap_or_else(store::home);
         let index = self.add_tab(new_session_id(), cwd, "Claude Code".into());
+        self.tabs[index].fx = Fx::opening();
         self.activate(index);
     }
 
     fn close_tab(&mut self, index: usize) {
+        self.end_cycle();
         if index >= self.tabs.len() {
             return;
         }
@@ -134,7 +195,11 @@ impl App {
             }
             store::drop_if_boring(&session);
         }));
+        self.screen.close_tab(index, tab.title.clone(), std::mem::take(&mut tab.fx));
         self.closed.push((index, SavedTab { session: tab.session, cwd: tab.cwd, title: tab.title }));
+        if self.closed.len() > 50 {
+            self.closed.remove(0);
+        }
         if self.tabs.is_empty() {
             self.store.remove();
             self.quit = true;
@@ -153,7 +218,15 @@ impl App {
         };
         self.next_id += 1;
         let index = index.min(self.tabs.len());
-        let restored = Tab { id: self.next_id, session: tab.session, cwd: tab.cwd, title: tab.title, running: None };
+        let restored = Tab {
+            id: self.next_id,
+            session: tab.session,
+            cwd: tab.cwd,
+            title: tab.title,
+            running: None,
+            busy: false,
+            fx: Fx::opening(),
+        };
         self.tabs.insert(index, restored);
         self.activate(index);
     }
@@ -164,13 +237,15 @@ impl App {
             .iter()
             .map(|t| SavedTab { session: t.session.clone(), cwd: t.cwd.clone(), title: t.title.clone() })
             .collect();
-        self.store.save(&SavedWindow { tabs, active: self.active });
+        self.store.save(&SavedWindow { tabs, active: self.active, closed: self.closed.clone() });
     }
 
     fn sync_sessions(&mut self) {
         let mut changed = false;
-        for tab in &mut self.tabs {
+        let now = Instant::now();
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
             changed |= tab.sync_session();
+            self.dirty |= tab.fx.set_busy(tab.busy, i == self.active, now);
         }
         if changed {
             self.save();
@@ -198,20 +273,37 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) {
+    fn handle_key(&mut self, mut key: KeyEvent) {
+        if let KeyCode::Modifier(modifier) = key.code {
+            if key.kind == KeyEventKind::Release
+                && matches!(modifier, ModifierKeyCode::LeftControl | ModifierKeyCode::RightControl)
+            {
+                self.end_cycle();
+            }
+            return;
+        }
         if key.kind == KeyEventKind::Release {
             return;
+        }
+        if let KeyCode::Char(c) = key.code {
+            if c.is_uppercase() && key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                key.modifiers |= KeyModifiers::SHIFT;
+            }
         }
         let m = key.modifiers;
         let ctrl = m == KeyModifiers::CONTROL;
         let ctrl_shift = m == KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        match key.code {
+            KeyCode::Tab if ctrl => return self.cycle(1),
+            KeyCode::BackTab | KeyCode::Tab if ctrl_shift => return self.cycle(-1),
+            _ => self.end_cycle(),
+        }
         let count = self.tabs.len();
         match key.code {
             KeyCode::Char('t') if ctrl => return self.new_tab(),
             KeyCode::Char('t' | 'T') if ctrl_shift => return self.restore_tab(),
             KeyCode::Char('w') if ctrl => return self.close_tab(self.active),
-            KeyCode::Tab | KeyCode::PageDown if ctrl => return self.activate((self.active + 1) % count),
-            KeyCode::BackTab | KeyCode::Tab if ctrl_shift => return self.activate((self.active + count - 1) % count),
+            KeyCode::PageDown if ctrl => return self.activate((self.active + 1) % count),
             KeyCode::PageUp if ctrl => return self.activate((self.active + count - 1) % count),
             KeyCode::Char('9') if ctrl => return self.activate(count - 1),
             KeyCode::Char(c @ '1'..='8') if ctrl => return self.activate(c as usize - '1' as usize),
@@ -227,6 +319,20 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.end_cycle();
+        }
+        if self.dragging {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) if mouse.row == 0 => self.drag_to(mouse.column),
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.dragging = false;
+                    self.save();
+                },
+                _ => {},
+            }
+            return;
+        }
         let hover = (mouse.row == 0).then_some(mouse.column);
         if hover != self.hover {
             self.hover = hover;
@@ -236,7 +342,10 @@ impl App {
             let target = self.regions.iter().find(|r| mouse.column >= r.start && mouse.column < r.end);
             let count = self.tabs.len();
             match (mouse.kind, target.map(|r| &r.target)) {
-                (MouseEventKind::Down(MouseButton::Left), Some(Target::Tab(i))) => self.activate(*i),
+                (MouseEventKind::Down(MouseButton::Left), Some(Target::Tab(i))) => {
+                    self.activate(*i);
+                    self.dragging = true;
+                },
                 (MouseEventKind::Down(MouseButton::Left), Some(Target::Close(i))) => self.close_tab(*i),
                 (MouseEventKind::Down(MouseButton::Middle), Some(Target::Tab(i) | Target::Close(i))) => {
                     self.close_tab(*i)
@@ -259,6 +368,30 @@ impl App {
             MouseEventKind::ScrollUp => self.scroll_active(Scroll::Delta(3)),
             MouseEventKind::ScrollDown => self.scroll_active(Scroll::Delta(-3)),
             _ => {},
+        }
+    }
+
+    /// Moves the dragged tab once the pointer passes the middle of a neighbouring tab
+    fn drag_to(&mut self, column: u16) {
+        let span = |index: usize| {
+            let parts = self.regions.iter().filter(|r| matches!(r.target, Target::Tab(i) | Target::Close(i) if i == index));
+            parts.fold(None, |span: Option<(u16, u16)>, r| {
+                Some(span.map_or((r.start, r.end), |(start, end)| (start.min(r.start), end.max(r.end))))
+            })
+        };
+        let Some(target) = (0..self.tabs.len()).find(|&i| span(i).is_some_and(|(start, end)| column >= start && column < end))
+        else {
+            return;
+        };
+        let Some((start, end)) = span(target) else {
+            return;
+        };
+        let middle = (start + end) / 2;
+        if (target > self.active && column >= middle) || (target < self.active && column < middle) {
+            let tab = self.tabs.remove(self.active);
+            self.tabs.insert(target, tab);
+            self.active = target;
+            self.render();
         }
     }
 
@@ -330,8 +463,9 @@ impl App {
 
     fn render(&mut self) {
         self.dirty = false;
-        let titles: Vec<&str> = self.tabs.iter().map(|t| t.title.as_str()).collect();
-        self.regions = self.screen.draw_tabbar(&titles, self.active, self.hover);
+        let mut items: Vec<(&str, &mut Fx)> = self.tabs.iter_mut().map(|t| (t.title.as_str(), &mut t.fx)).collect();
+        (self.regions, self.animating) = self.screen.draw_tabbar(&mut items, self.active, self.hover, Instant::now());
+        drop(items);
         let cursor = match self.tabs.get(self.active).and_then(|t| t.running.as_ref()) {
             Some(running) => self.screen.draw_term(&running.term.lock()),
             None => {
@@ -347,7 +481,8 @@ impl App {
     fn run(&mut self, rx: Receiver<AppEvent>) {
         let mut last_sync = Instant::now();
         while !self.quit {
-            match rx.recv_timeout(Duration::from_secs(1)) {
+            let timeout = if self.animating { Duration::from_millis(33) } else { Duration::from_secs(1) };
+            match rx.recv_timeout(timeout) {
                 Ok(event) => self.dispatch(event),
                 Err(RecvTimeoutError::Timeout) => {},
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -359,7 +494,7 @@ impl App {
                 self.sync_sessions();
                 last_sync = Instant::now();
             }
-            if self.dirty && !self.quit {
+            if (self.dirty || self.animating) && !self.quit {
                 self.render();
             }
         }
@@ -369,6 +504,7 @@ impl App {
         match event {
             AppEvent::Input(event) => self.handle_input(event),
             AppEvent::Term(id, event) => self.handle_term(id, event),
+            AppEvent::NewTab => self.new_tab(),
             AppEvent::InputClosed => {
                 self.sync_sessions();
                 for tab in &self.tabs {
@@ -410,7 +546,12 @@ fn main() {
         quit: false,
         closed: Vec::new(),
         cleanups: Vec::new(),
+        mru: Vec::new(),
+        cycling: None,
+        dragging: false,
+        animating: false,
     };
+    app.closed = saved.closed;
     for saved_tab in saved.tabs {
         app.add_tab(saved_tab.session, saved_tab.cwd, saved_tab.title);
     }

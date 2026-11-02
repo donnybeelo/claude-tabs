@@ -15,6 +15,8 @@ pub struct SavedTab {
 pub struct SavedWindow {
     pub tabs: Vec<SavedTab>,
     pub active: usize,
+    #[serde(default)]
+    pub closed: Vec<(usize, SavedTab)>,
 }
 
 pub struct Store {
