@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::fx::{Fx, MARQUEE_DELAY, MARQUEE_STEP};
+use crate::fx::{Fx, MARQUEE_DELAY, MARQUEE_STEP, WIDTH_SPRING_FREQUENCY};
 
 #[derive(Clone, Copy, PartialEq, Default)]
 pub enum Col {
@@ -272,7 +272,7 @@ impl Screen {
                 fx.selected.value = selected;
             }
             animating |= fx.shift.step(0.0, dt);
-            animating |= fx.width.step(target_width, dt);
+            animating |= fx.width.step_at(target_width, dt, WIDTH_SPRING_FREQUENCY);
             fx.x.value = base + fx.shift.value;
             base += fx.width.value;
             animating |= fx.selected.step(selected, dt);

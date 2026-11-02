@@ -18,6 +18,7 @@ const GLOW_RELEASE_PEAK: f32 = 1.25;
 const GLOW_TAIL: f32 = 12.0;
 const GLOW_STRENGTH: f32 = 0.6;
 const SPRING_FREQUENCY: f32 = 2.0 * std::f32::consts::PI / (0.1 * 1.2);
+pub const WIDTH_SPRING_FREQUENCY: f32 = 2.0 * std::f32::consts::PI / (0.2 * 1.2);
 pub const MARQUEE_DELAY: Duration = Duration::from_millis(600);
 pub const MARQUEE_STEP: Duration = Duration::from_millis(80);
 
@@ -65,16 +66,20 @@ pub struct Spring {
 impl Spring {
     /// Moves towards the target with a critically damped spring, returning whether it is still moving
     pub fn step(&mut self, target: f32, dt: f32) -> bool {
+        self.step_at(target, dt, SPRING_FREQUENCY)
+    }
+
+    pub fn step_at(&mut self, target: f32, dt: f32, frequency: f32) -> bool {
         let offset = self.value - target;
         if offset.abs() < 0.002 && self.velocity.abs() < 0.002 {
             self.value = target;
             self.velocity = 0.0;
             return false;
         }
-        let decay = (-SPRING_FREQUENCY * dt).exp();
-        let carry = (self.velocity + SPRING_FREQUENCY * offset) * dt;
+        let decay = (-frequency * dt).exp();
+        let carry = (self.velocity + frequency * offset) * dt;
         self.value = target + (offset + carry) * decay;
-        self.velocity = (self.velocity - SPRING_FREQUENCY * carry) * decay;
+        self.velocity = (self.velocity - frequency * carry) * decay;
         true
     }
 }
