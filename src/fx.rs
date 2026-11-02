@@ -82,10 +82,12 @@ impl Spring {
 #[derive(Default)]
 pub struct Fx {
     pub x: Spring,
+    pub shift: Spring,
     pub width: Spring,
     pub selected: Spring,
     pub placed: bool,
     pub opening: bool,
+    pub appear_at: Option<Instant>,
     busy: bool,
     unread: bool,
     run_start: Option<Instant>,
@@ -104,6 +106,10 @@ pub struct CellFx {
 impl Fx {
     pub fn opening() -> Fx {
         Fx { opening: true, ..Default::default() }
+    }
+
+    pub fn opening_at(at: Instant) -> Fx {
+        Fx { opening: true, appear_at: Some(at), ..Default::default() }
     }
 
     /// Records whether Claude is working, returning whether anything visible changed

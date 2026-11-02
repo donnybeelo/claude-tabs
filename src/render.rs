@@ -250,6 +250,7 @@ impl Screen {
         let mut animating = !closing.is_empty();
         let mut layout = Vec::new();
         let mut target_x = 0.0f32;
+        let mut base = 0.0f32;
         for (&slot, title) in order.iter().zip(&titles) {
             let text = truncate(title, title_max);
             let width = text.width() as u16 + 4;
@@ -258,17 +259,22 @@ impl Screen {
                 Slot::Closing(c) => &mut closing[c].2,
             };
             let (target_width, selected) = match slot {
-                Slot::Live(i) => (width as f32, if i == active { 1.0 } else { 0.0 }),
+                Slot::Live(i) => {
+                    let waiting = fx.appear_at.is_some_and(|t| now < t);
+                    animating |= waiting;
+                    (if waiting { 0.0 } else { width as f32 }, if i == active { 1.0 } else { 0.0 })
+                },
                 Slot::Closing(_) => (0.0, fx.selected.value),
             };
             if !fx.placed {
                 fx.placed = true;
-                fx.x.value = target_x;
                 fx.width.value = if fx.opening { 0.0 } else { target_width };
                 fx.selected.value = selected;
             }
-            animating |= fx.x.step(target_x, dt);
+            animating |= fx.shift.step(0.0, dt);
             animating |= fx.width.step(target_width, dt);
+            fx.x.value = base + fx.shift.value;
+            base += fx.width.value;
             animating |= fx.selected.step(selected, dt);
             animating |= fx.animating(now);
             let fits = target_x + width as f32 <= available as f32;
@@ -285,9 +291,10 @@ impl Screen {
                 Slot::Closing(c) => &closing[c].2,
             }
         };
-        let span = |fx: &Fx, width: u16| {
-            let x = fx.x.value.round().max(0.0) as u16;
-            (x, (fx.width.value.round().max(0.0) as u16).min(width))
+        let span = |fx: &Fx, _width: u16| {
+            let start = fx.x.value.round().max(0.0);
+            let end = (fx.x.value + fx.width.value).round().max(start);
+            (start as u16, (end - start) as u16)
         };
         let hovered_tab = hover.and_then(|h| {
             order.iter().zip(&layout).find_map(|(&slot, (_, width, _))| {
@@ -318,7 +325,7 @@ impl Screen {
                 Slot::Closing(_) => None,
             };
             let end = x + w;
-            let full = live.is_some() && w == *width;
+            let full = live.is_some() && w >= *width;
             let hovered = live.is_some() && hovered_tab == live;
             let close_hovered = full && hover.is_some_and(|h| h + 3 >= end && h < end);
             let base = if hovered && live != Some(active) { HOVERED } else { INACTIVE };
@@ -332,13 +339,14 @@ impl Screen {
                 }
                 animating = true;
             }
+            self.put_str_until(x, end, 0, &" ".repeat(w as usize), BLACK, bg, BOLD);
             let after_title = self.put_str_until(x, end, 0, &format!(" {shown}"), BLACK, bg, BOLD);
             let glyph = if close_hovered { " \u{f00d}" } else { " ×" };
             self.put_str_until(after_title, end, 0, glyph, BLACK, bg, BOLD);
             if full {
                 self.put_str(end - 1, 0, "▕", BLACK, bg, 0);
             }
-            for (j, effect) in fx.cells(*width as usize, now).iter().take(w as usize).enumerate() {
+            for (j, effect) in fx.cells(w.max(*width) as usize, now).iter().take(w.min(self.cols.saturating_sub(x)) as usize).enumerate() {
                 let cell = &mut self.back[x as usize + j];
                 cell.bg = mix(mix(cell.bg, ACTIVE, effect.accent), WHITE, effect.sweep);
             }

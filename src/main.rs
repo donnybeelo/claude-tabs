@@ -388,8 +388,16 @@ impl App {
         };
         let middle = (start + end) / 2;
         if (target > self.active && column >= middle) || (target < self.active && column < middle) {
-            let tab = self.tabs.remove(self.active);
+            let from = self.active;
+            let tab = self.tabs.remove(from);
             self.tabs.insert(target, tab);
+            let (passed, sign) = if target > from { (from..target, 1.0) } else { (target + 1..from + 1, -1.0) };
+            let moved_width = self.tabs[target].fx.width.value;
+            let passed_width: f32 = passed.clone().map(|i| self.tabs[i].fx.width.value).sum();
+            self.tabs[target].fx.shift.value -= sign * passed_width;
+            for i in passed {
+                self.tabs[i].fx.shift.value += sign * moved_width;
+            }
             self.active = target;
             self.render();
         }
@@ -552,8 +560,10 @@ fn main() {
         animating: false,
     };
     app.closed = saved.closed;
+    let start = Instant::now();
     for saved_tab in saved.tabs {
-        app.add_tab(saved_tab.session, saved_tab.cwd, saved_tab.title);
+        let index = app.add_tab(saved_tab.session, saved_tab.cwd, saved_tab.title);
+        app.tabs[index].fx = Fx::opening_at(start + Duration::from_millis(60 * index as u64));
     }
     if app.tabs.is_empty() {
         app.new_tab();
