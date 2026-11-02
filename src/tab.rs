@@ -5,7 +5,6 @@ use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty::{self, Shell};
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -68,9 +67,7 @@ pub struct Tab {
 
 pub fn new_session_id() -> String {
     let mut b = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut b);
-    }
+    let _ = getrandom::fill(&mut b);
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
@@ -96,9 +93,14 @@ impl Tab {
             working_directory: Some(self.cwd.clone()),
             drain_on_exit: false,
             env: HashMap::from([("CLAUDE_TABS_PID".into(), std::process::id().to_string())]),
+            #[cfg(windows)]
+            escape_args: true,
         };
         let pty = tty::new(&options, size.window(), self.id)?;
+        #[cfg(unix)]
         let pid = pty.child().id();
+        #[cfg(windows)]
+        let pid = pty.child_watcher().pid().map_or(0, |pid| pid.get());
         let listener = Listener { tab: self.id, tx: tx.clone() };
         let config = Config { kitty_keyboard: true, scrolling_history: 10_000, ..Default::default() };
         let term = Arc::new(FairMutex::new(Term::new(config, &size, listener.clone())));
@@ -124,9 +126,12 @@ impl Tab {
 
     pub fn kill(&self) {
         if let Some(running) = &self.running {
+            #[cfg(unix)]
             unsafe {
                 libc::kill(running.pid as i32, libc::SIGHUP);
             }
+            #[cfg(windows)]
+            let _ = running.notifier.0.send(Msg::Shutdown);
         }
     }
 

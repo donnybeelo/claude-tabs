@@ -25,11 +25,12 @@ pub struct Store {
 }
 
 pub fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default()
 }
 
 fn state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
+        .or_else(|| std::env::var_os("LOCALAPPDATA").filter(|_| cfg!(windows)))
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".local/state"))
         .join("claude-tabs")

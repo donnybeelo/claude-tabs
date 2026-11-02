@@ -1,5 +1,6 @@
 mod fx;
 mod keys;
+mod platform;
 mod render;
 mod store;
 mod tab;
@@ -34,46 +35,6 @@ fn restore_terminal() {
     let _ = out.write_all(TEARDOWN);
     let _ = out.flush();
     let _ = crossterm::terminal::disable_raw_mode();
-}
-
-static HANGUP_PIPE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-
-extern "C" fn on_hangup(_: libc::c_int) {
-    let fd = HANGUP_PIPE.load(std::sync::atomic::Ordering::Relaxed);
-    unsafe {
-        libc::write(fd, b"x".as_ptr().cast(), 1);
-    }
-}
-
-extern "C" fn on_new_tab(_: libc::c_int) {
-    let fd = HANGUP_PIPE.load(std::sync::atomic::Ordering::Relaxed);
-    unsafe {
-        libc::write(fd, b"n".as_ptr().cast(), 1);
-    }
-}
-
-fn watch_hangup(tx: Sender<AppEvent>) {
-    let mut fds = [0; 2];
-    unsafe {
-        libc::pipe(fds.as_mut_ptr());
-    }
-    HANGUP_PIPE.store(fds[1], std::sync::atomic::Ordering::Relaxed);
-    unsafe {
-        libc::signal(libc::SIGHUP, on_hangup as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, on_hangup as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGUSR1, on_new_tab as *const () as libc::sighandler_t);
-    }
-    std::thread::spawn(move || {
-        let mut byte = 0u8;
-        while unsafe { libc::read(fds[0], (&mut byte as *mut u8).cast(), 1) } == 1 {
-            if byte == b'n' {
-                let _ = tx.send(AppEvent::NewTab);
-            } else {
-                let _ = tx.send(AppEvent::InputClosed);
-                break;
-            }
-        }
-    });
 }
 
 fn base64(data: &[u8]) -> String {
@@ -184,11 +145,11 @@ impl App {
         let mut tab = self.tabs.remove(index);
         tab.sync_session();
         tab.kill();
-        let pid = tab.running.as_ref().map(|r| r.pid as i32);
+        let pid = tab.running.as_ref().map(|r| r.pid);
         let session = tab.session.clone();
         self.cleanups.push(std::thread::spawn(move || {
             for _ in 0..100 {
-                if pid.is_none_or(|pid| unsafe { libc::kill(pid, 0) } != 0) {
+                if pid.is_none_or(|pid| !platform::process_alive(pid)) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -527,6 +488,7 @@ impl App {
 
 fn main() {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    platform::enable_vt();
     let _ = crossterm::terminal::enable_raw_mode();
     let mut out = std::io::stdout();
     let _ = out.write_all(SETUP);
@@ -538,7 +500,7 @@ fn main() {
     }));
 
     let (tx, rx) = mpsc::channel();
-    watch_hangup(tx.clone());
+    platform::watch_hangup(tx.clone());
     let (store, saved) = Store::open();
     let mut app = App {
         tabs: Vec::new(),
