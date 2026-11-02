@@ -327,7 +327,8 @@ impl Screen {
             let end = x + w;
             let full = live.is_some() && w >= *width;
             let hovered = live.is_some() && hovered_tab == live;
-            let close_hovered = full && hover.is_some_and(|h| h + 3 >= end && h < end);
+            let close_col = x + text.width() as u16 + 2;
+            let close_hovered = full && hover == Some(close_col);
             let base = if hovered && live != Some(active) { HOVERED } else { INACTIVE };
             let bg = mix(base, ACTIVE, fx.selected.value);
             let mut shown = text.clone();
@@ -341,8 +342,8 @@ impl Screen {
             }
             self.put_str_until(x, end, 0, &" ".repeat(w as usize), BLACK, bg, BOLD);
             let after_title = self.put_str_until(x, end, 0, &format!(" {shown}"), BLACK, bg, BOLD);
-            let glyph = if close_hovered { " \u{f00d}" } else { " ×" };
-            self.put_str_until(after_title, end, 0, glyph, BLACK, bg, BOLD);
+            let close_attrs = if close_hovered { BOLD } else { 0 };
+            self.put_str_until(after_title, end, 0, " ×", BLACK, bg, close_attrs);
             if full {
                 self.put_str(end - 1, 0, "▕", BLACK, bg, 0);
             }
@@ -352,8 +353,9 @@ impl Screen {
             }
             match live {
                 Some(i) if full => {
-                    regions.push(Region { start: x, end: end - 3, target: Target::Tab(i) });
-                    regions.push(Region { start: end - 3, end, target: Target::Close(i) });
+                    regions.push(Region { start: x, end: close_col, target: Target::Tab(i) });
+                    regions.push(Region { start: close_col, end: close_col + 1, target: Target::Close(i) });
+                    regions.push(Region { start: close_col + 1, end, target: Target::Tab(i) });
                 },
                 Some(i) => regions.push(Region { start: x, end, target: Target::Tab(i) }),
                 None => {},
