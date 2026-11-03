@@ -163,7 +163,7 @@ impl App {
         }
         if self.tabs.is_empty() {
             self.store.remove();
-            self.quit = true;
+            self.dirty = true;
             return;
         }
         if index < self.active || self.active >= self.tabs.len() {
@@ -437,6 +437,10 @@ impl App {
         drop(items);
         let cursor = match self.tabs.get(self.active).and_then(|t| t.running.as_ref()) {
             Some(running) => self.screen.draw_term(&running.term.lock()),
+            None if self.tabs.is_empty() => {
+                self.screen.draw_message("");
+                None
+            },
             None => {
                 self.screen.draw_message("Could not start claude");
                 None
@@ -465,6 +469,9 @@ impl App {
             }
             if (self.dirty || self.animating) && !self.quit {
                 self.render();
+            }
+            if self.tabs.is_empty() && !self.animating {
+                self.quit = true;
             }
         }
     }
