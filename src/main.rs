@@ -97,7 +97,7 @@ impl App {
         let tab = &mut self.tabs[index];
         tab.fx.seen(Instant::now());
         if tab.running.is_none() {
-            let _ = tab.start(self.size, &self.tx);
+            let _ = tab.start(self.size, &self.tx, self.light);
         }
         self.screen.invalidate();
         self.dirty = true;

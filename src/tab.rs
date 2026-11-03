@@ -75,7 +75,7 @@ pub fn new_session_id() -> String {
 }
 
 impl Tab {
-    pub fn start(&mut self, size: Size, tx: &Sender<AppEvent>) -> std::io::Result<()> {
+    pub fn start(&mut self, size: Size, tx: &Sender<AppEvent>, light: bool) -> std::io::Result<()> {
         let flag = match find_conversation(&self.session) {
             Some(cwd) => {
                 if !cwd.as_os_str().is_empty() {
@@ -92,7 +92,10 @@ impl Tab {
             shell: Some(Shell::new("claude".into(), vec![flag.into(), self.session.clone()])),
             working_directory: Some(self.cwd.clone()),
             drain_on_exit: false,
-            env: HashMap::from([("CLAUDE_TABS_PID".into(), std::process::id().to_string())]),
+            env: HashMap::from([
+                ("CLAUDE_TABS_PID".into(), std::process::id().to_string()),
+                ("COLORFGBG".into(), if light { "0;15" } else { "15;0" }.into()),
+            ]),
             #[cfg(windows)]
             escape_args: true,
         };
