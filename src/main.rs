@@ -449,6 +449,8 @@ impl App {
             return;
         }
         self.light = light;
+        self.screen.light = light;
+        self.dirty = true;
         let push = if light { "\x1b[?997;2n" } else { "\x1b[?997;1n" };
         for tab in &self.tabs {
             tab.write(push.as_bytes().to_vec());

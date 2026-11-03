@@ -32,6 +32,8 @@ const CURLY_UNDERLINE: u16 = 1024;
 const ACTIVE: Col = Col::Rgb(0xd9, 0x77, 0x57);
 const INACTIVE: Col = Col::Rgb(0x8a, 0x8a, 0x8a);
 const HOVERED: Col = Col::Rgb(0xee, 0xee, 0xee);
+const INACTIVE_LIGHT: Col = Col::Rgb(0xd4, 0xd4, 0xd8);
+const HOVERED_LIGHT: Col = Col::Rgb(0xbd, 0xbd, 0xc2);
 const BLACK: Col = Col::Rgb(0, 0, 0);
 const WHITE: Col = Col::Rgb(0xff, 0xff, 0xff);
 
@@ -66,6 +68,7 @@ pub struct Screen {
     last_frame: Option<Instant>,
     hover_tab: Option<(usize, Instant)>,
     closing: Vec<(usize, String, Fx)>,
+    pub light: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -186,6 +189,7 @@ impl Screen {
             last_frame: None,
             hover_tab: None,
             closing: Vec::new(),
+            light: false,
         }
     }
 
@@ -229,6 +233,7 @@ impl Screen {
         hover: Option<u16>,
         now: Instant,
     ) -> (Vec<Region>, bool) {
+        let (inactive, hovered_bg) = if self.light { (INACTIVE_LIGHT, HOVERED_LIGHT) } else { (INACTIVE, HOVERED) };
         let dt = self.last_frame.map_or(0.0, |t| now.saturating_duration_since(t).as_secs_f32().min(0.05));
         self.last_frame = Some(now);
         self.back[..self.cols as usize].fill(blank());
@@ -329,7 +334,7 @@ impl Screen {
             let hovered = live.is_some() && hovered_tab == live;
             let close_col = x + text.width() as u16 + 2;
             let close_hovered = full && hover == Some(close_col);
-            let base = if hovered && live != Some(active) { HOVERED } else { INACTIVE };
+            let base = if hovered && live != Some(active) { hovered_bg } else { inactive };
             let bg = mix(base, ACTIVE, fx.selected.value);
             let mut shown = text.clone();
             if let Some((_, since)) = self.hover_tab.filter(|_| hovered && text != title) {
@@ -364,7 +369,7 @@ impl Screen {
         }
         if bar_end + 3 <= self.cols {
             let hovered = hover.is_some_and(|h| h >= bar_end && h < bar_end + 3);
-            self.put_str(bar_end, 0, " + ", BLACK, if hovered { HOVERED } else { INACTIVE }, BOLD);
+            self.put_str(bar_end, 0, " + ", BLACK, if hovered { hovered_bg } else { inactive }, BOLD);
             regions.push(Region { start: bar_end, end: bar_end + 3, target: Target::New });
         }
         closing.retain(|(_, _, fx)| fx.width.value >= 0.5);
