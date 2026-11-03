@@ -556,8 +556,9 @@ fn main() {
         cycling: None,
         dragging: false,
         animating: false,
-        light: false,
+        light: platform::is_light(),
     };
+    app.screen.light = app.light;
     app.closed = saved.closed;
     let start = Instant::now();
     for saved_tab in saved.tabs {
