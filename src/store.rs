@@ -20,7 +20,6 @@ pub struct SavedWindow {
 }
 
 pub struct Store {
-    path: PathBuf,
     file: File,
 }
 
@@ -112,6 +111,7 @@ impl Store {
             .collect();
         candidates.sort_by(|a, b| b.0.cmp(&a.0));
 
+        let mut leftover: Vec<(usize, SavedTab)> = Vec::new();
         for (_, path) in candidates {
             let Ok(file) = File::options().read(true).write(true).open(&path) else {
                 continue;
@@ -124,11 +124,15 @@ impl Store {
                 .and_then(|bytes| serde_json::from_slice(&bytes).ok())
                 .unwrap_or_default();
             if saved.tabs.is_empty() {
+                if leftover.is_empty() {
+                    leftover = saved.closed;
+                }
                 let _ = fs::remove_file(&path);
                 continue;
             }
             saved.active = saved.active.min(saved.tabs.len() - 1);
-            return (Store { path, file }, saved);
+            saved.closed.extend(leftover);
+            return (Store { file }, saved);
         }
 
         let nanos = SystemTime::now()
@@ -144,7 +148,7 @@ impl Store {
             .open(&path)
             .expect("cannot create state file");
         let _ = file.try_lock();
-        (Store { path, file }, SavedWindow::default())
+        (Store { file }, SavedWindow { closed: leftover, ..Default::default() })
     }
 
     pub fn save(&self, window: &SavedWindow) {
@@ -159,10 +163,6 @@ impl Store {
 
     pub fn touch(&self) {
         let _ = self.file.set_modified(SystemTime::now());
-    }
-
-    pub fn remove(&self) {
-        let _ = fs::remove_file(&self.path);
     }
 }
 

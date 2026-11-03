@@ -162,7 +162,7 @@ impl App {
             self.closed.remove(0);
         }
         if self.tabs.is_empty() {
-            self.store.remove();
+            self.save();
             self.dirty = true;
             return;
         }
