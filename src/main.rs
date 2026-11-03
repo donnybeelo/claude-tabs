@@ -8,6 +8,7 @@ mod tab;
 use alacritty_terminal::event::{Event as TermEvent, WindowSize};
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::term::TermMode;
+use alacritty_terminal::vte::ansi::{NamedColor, Rgb};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -25,7 +26,11 @@ pub enum AppEvent {
     InputClosed,
     NewTab,
     Term(u64, TermEvent),
+    ColorScheme(bool),
 }
+
+const FOREGROUND: usize = NamedColor::Foreground as usize;
+const BACKGROUND: usize = NamedColor::Background as usize;
 
 const SETUP: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[?1003h\x1b[?1006h\x1b[?2004h\x1b[?1004h\x1b[>15u";
 const TEARDOWN: &[u8] = b"\x1b[<u\x1b[?1004l\x1b[?2004l\x1b[?1006l\x1b[?1003l\x1b[0m\x1b[?25h\x1b[?1049l";
@@ -67,6 +72,7 @@ struct App {
     cycling: Option<usize>,
     dragging: bool,
     animating: bool,
+    light: bool,
 }
 
 impl App {
@@ -426,7 +432,26 @@ impl App {
                 let _ = std::io::stdout().write_all(b"\x07");
             },
             TermEvent::ChildExit(_) => self.close_tab(index),
+            TermEvent::ColorRequest(slot @ (FOREGROUND | BACKGROUND), format) => {
+                let (fg, bg) = if self.light {
+                    (Rgb { r: 0x22, g: 0x22, b: 0x26 }, Rgb { r: 0xfa, g: 0xfa, b: 0xfb })
+                } else {
+                    (Rgb { r: 0xd8, g: 0xd8, b: 0xd8 }, Rgb { r: 0x18, g: 0x18, b: 0x18 })
+                };
+                self.tabs[index].write(format(if slot == BACKGROUND { bg } else { fg }).into_bytes());
+            },
             _ => {},
+        }
+    }
+
+    fn set_color_scheme(&mut self, light: bool) {
+        if self.light == light {
+            return;
+        }
+        self.light = light;
+        let push = if light { "\x1b[?997;2n" } else { "\x1b[?997;1n" };
+        for tab in &self.tabs {
+            tab.write(push.as_bytes().to_vec());
         }
     }
 
@@ -481,6 +506,7 @@ impl App {
             AppEvent::Input(event) => self.handle_input(event),
             AppEvent::Term(id, event) => self.handle_term(id, event),
             AppEvent::NewTab => self.new_tab(),
+            AppEvent::ColorScheme(light) => self.set_color_scheme(light),
             AppEvent::InputClosed => {
                 self.sync_sessions();
                 for tab in &self.tabs {
@@ -508,6 +534,7 @@ fn main() {
 
     let (tx, rx) = mpsc::channel();
     platform::watch_hangup(tx.clone());
+    platform::watch_color_scheme(tx.clone());
     let (store, saved) = Store::open();
     let mut app = App {
         tabs: Vec::new(),
@@ -527,6 +554,7 @@ fn main() {
         cycling: None,
         dragging: false,
         animating: false,
+        light: false,
     };
     app.closed = saved.closed;
     let start = Instant::now();

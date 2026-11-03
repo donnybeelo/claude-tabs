@@ -46,6 +46,27 @@ mod imp {
         });
     }
 
+    pub fn watch_color_scheme(tx: Sender<AppEvent>) {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+
+        std::thread::spawn(move || {
+            let is_light = |s: &str| !s.contains("prefer-dark");
+            let key = ["org.gnome.desktop.interface", "color-scheme"];
+            if let Ok(out) = Command::new("gsettings").arg("get").args(key).output() {
+                let _ = tx.send(AppEvent::ColorScheme(is_light(&String::from_utf8_lossy(&out.stdout))));
+            }
+            let Ok(mut child) = Command::new("gsettings").arg("monitor").args(key).stdout(Stdio::piped()).spawn() else {
+                return;
+            };
+            for line in BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok) {
+                if tx.send(AppEvent::ColorScheme(is_light(&line))).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
     pub fn process_alive(pid: u32) -> bool {
         unsafe { libc::kill(pid as i32, 0) == 0 }
     }
@@ -121,6 +142,8 @@ mod imp {
             alive
         }
     }
+
+    pub fn watch_color_scheme(_: Sender<AppEvent>) {}
 
     pub fn enable_vt() {
         let _ = crossterm::ansi_support::supports_ansi();
